@@ -1,69 +1,51 @@
 """
-State compaction: shrink the raw STS2MCP game-state JSON before sending it to
-Claude, without losing decision-relevant information.
+State compaction: shrink the STS2MCP game-state JSON before sending it to Claude.
 
-Why: the agent sends state to the model every step, and a run is hundreds of
-steps. Raw mod state is full of rendering/engine noise (sprite paths, colors,
-screen coordinates, animation flags, internal ids) that costs input tokens but
-tells Claude nothing about how to play. Stripping it is the biggest per-turn
-cost lever.
+Tuned to the real STS2MCP v0.4.0 schema (raw-full.md). That schema is already
+clean semantic JSON — there's no sprite/color/coordinate noise to strip. The
+actual token bloat is:
 
-The pruner is schema-agnostic on purpose, because STS2MCP's exact field names
-are version-dependent. It works by key-name patterns plus a couple of structural
-rules, so it degrades gracefully on a schema we haven't seen. Once we know the
-real schema we can tighten KEEP_ALWAYS / NOISE_KEY_PATTERNS to match.
+  * `keywords` arrays — every card/relic/potion/power repeats keyword name+text
+    (Vulnerable, Exhaust, ...). Claude knows these; the card's own `description`
+    already states the effect. Dropping them is a big, low-risk saving.
+  * `combat_id` — an internal numeric id we never use (we target by `entity_id`).
+  * Verbose `description` strings — truncated past a cap.
+
+We deliberately PRESERVE the handles actions need: `entity_id`, `index`, `slot`,
+`id`, and gameplay fields. The optional `drop_piles` flag can also strip the
+draw/discard/exhaust pile listings, which are large; off by default since pile
+knowledge helps planning.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-# Keys whose VALUES are presentation/engine noise, not gameplay decisions.
-# We act on cards/options by index, never by internal id, so ids are noise too.
-NOISE_KEY_PATTERNS = [
-    r"image", r"sprite", r"texture", r"icon", r"asset", r"portrait", r"art",
-    r"url", r"uri", r"path", r"uuid", r"guid", r"hash",
-    r"colou?r", r"tint", r"alpha", r"opacity",
-    r"position", r"coord", r"offset", r"scale", r"rotation", r"^[xy]$", r"^z$",
-    r"anim", r"sound", r"sfx", r"vfx", r"shader", r"font", r"tween",
-    r"^id$", r"_id$", r"internal", r"^seed$", r"render", r"layout", r"pixel",
-]
-_NOISE_RE = re.compile("|".join(NOISE_KEY_PATTERNS), re.IGNORECASE)
+# Keys removed wherever they appear — pure token bloat for decision-making.
+DROP_KEYS = {"keywords", "combat_id"}
 
-# Keys we never prune even if a value looks empty/falsy — these carry meaning
-# (0 block, 0 energy, empty hand are all decision-relevant facts).
-KEEP_ALWAYS = {
-    "block", "energy", "hp", "current_hp", "max_hp", "cost", "damage",
-    "name", "intent", "screen", "screen_type", "hand", "monsters", "enemies",
-    "powers", "relics", "potions", "choices", "options", "floor", "act",
-}
+# Pile listings are large; dropping them is opt-in.
+PILE_KEYS = {"draw_pile", "discard_pile", "exhaust_pile"}
 
-MAX_STR_LEN = 400  # truncate verbose description strings
+MAX_STR_LEN = 300  # truncate verbose description strings
 
 
-def _prune(value: Any, key: str | None = None) -> Any:
-    """Recursively strip noise. Returns a cleaned copy."""
+def _prune(value: Any, drop_piles: bool) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if _NOISE_RE.search(k) and k.lower() not in KEEP_ALWAYS:
+            if k in DROP_KEYS:
                 continue
-            cleaned = _prune(v, k)
-            if _is_empty(cleaned) and (k.lower() not in KEEP_ALWAYS):
+            if drop_piles and k in PILE_KEYS:
                 continue
-            out[k] = cleaned
+            out[k] = _prune(v, drop_piles)
         return out
     if isinstance(value, list):
-        return [_prune(v, key) for v in value]
+        return [_prune(v, drop_piles) for v in value]
     if isinstance(value, str) and len(value) > MAX_STR_LEN:
         return value[:MAX_STR_LEN] + "…"
     return value
-
-
-def _is_empty(v: Any) -> bool:
-    return v is None or v == "" or v == [] or v == {}
 
 
 def estimate_tokens(obj: Any) -> int:
@@ -72,7 +54,7 @@ def estimate_tokens(obj: Any) -> int:
     return len(text) // 4
 
 
-def compact_state(state: dict[str, Any]) -> dict[str, Any]:
+def compact_state(state: dict[str, Any], drop_piles: bool = False) -> dict[str, Any]:
     """Return a pruned copy of the state suitable for sending to Claude.
 
     Pure function — does not mutate the input. The agent keeps the raw state for
@@ -80,4 +62,4 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(state, dict):
         return state
-    return _prune(state)
+    return _prune(state, drop_piles)

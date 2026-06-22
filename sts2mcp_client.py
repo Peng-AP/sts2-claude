@@ -20,9 +20,12 @@ from typing import Any
 import requests
 
 
-# --- The two spots to confirm against your installed mod version ----------
-STATE_PATH = "/state"     # GET  -> current game state as JSON
-ACTION_PATH = "/action"   # POST -> {"action": <name>, ...params} or similar
+# --- Confirmed against STS2MCP v0.4.0 (raw-full.md) -----------------------
+# State and actions share ONE path; GET reads state, POST performs an action.
+# (Multiplayer uses /api/v1/multiplayer; mixing the two returns HTTP 409.)
+STATE_PATH = "/api/v1/singleplayer"   # GET  -> current game state as JSON
+ACTION_PATH = "/api/v1/singleplayer"  # POST -> {"action": <verb>, ...params}
+HEALTH_PATH = "/"                     # GET  -> {"message": "...", "status": "ok"}
 # --------------------------------------------------------------------------
 
 

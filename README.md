@@ -40,20 +40,24 @@ A run is hundreds of model calls, so two levers are built in:
   definitions — is marked with `cache_control`, so it's cached and reused across
   steps instead of re-billed at full price every call.
 
-## ⚠️ Confirm against your mod build
+## Mod API (confirmed against STS2MCP v0.4.0)
 
-A few spots are coupled to STS2MCP's exact API and are marked in-code with
-`VERSION-DEPENDENT`. Once the mod is running, hit it and adjust these to match:
+The code is written against the real STS2MCP API (see the mod's own
+`docs/raw-full.md` in the [STS2MCP repo](https://github.com/Gennadiyev/STS2MCP)):
 
-- `sts2mcp_client.py`: `STATE_PATH`, `ACTION_PATH` (the GET/POST endpoint paths).
-- `tools.py` → `action_from_tool_call`: the action payload field names.
-- `agent.py` → `_run_is_over` / `_looks_like_state`: the state schema keys used
-  to detect end-of-run and whether an action response already contains new state.
+- **State + actions share one path**: `GET /api/v1/singleplayer` reads state,
+  `POST /api/v1/singleplayer` performs an action `{"action": <verb>, ...}`.
+  (Multiplayer uses `/api/v1/multiplayer`; mixing them returns HTTP 409.)
+- **Screens** are identified by `state_type` (monster/elite/boss, rewards,
+  card_reward, map, event, rest_site, shop, treasure, selection overlays, menu,
+  game_over). `tools.py` maps the generic `choose`/`confirm`/`skip` tools to the
+  correct screen-specific verb.
+- **Targeting** uses an enemy's `entity_id` string (e.g. `"JAW_WORM_0"`).
 
-Quick way to inspect the real schema:
+Inspect live state anytime with the game running:
 
 ```bash
-curl http://127.0.0.1:15526/state
+curl http://127.0.0.1:15526/api/v1/singleplayer     # or: python probe.py
 ```
 
-then align the field names above with what you see.
+Verified working on game **v0.107.1** with mod **v0.4.0**.

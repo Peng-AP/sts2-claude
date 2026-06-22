@@ -15,7 +15,7 @@ from anthropic import Anthropic
 
 from state_compaction import compact_state, estimate_tokens
 from sts2mcp_client import STS2MCPClient
-from tools import TOOLS, action_from_tool_call
+from tools import TOOLS, IllegalActionError, action_from_tool_call
 
 MODEL = "claude-opus-4-8"
 
@@ -24,16 +24,26 @@ You are an expert Slay the Spire 2 player controlling a full run. You will be \
 given the current game state as JSON on each step. Decide the single best next \
 action and take it by calling exactly one tool.
 
+The state's `state_type` tells you which screen you're on (monster/elite/boss \
+combat, rewards, card_reward, map, event, rest_site, shop, treasure, various \
+selection overlays, or menu). Act accordingly:
+- In combat, play cards with `play_card` using a card's `index`; if it targets \
+  an enemy, pass `target` as that enemy's `entity_id` (from battle.enemies). \
+  Use `end_turn` when done.
+- For any "pick option N" screen (rewards, card_reward, map, event, rest_site, \
+  shop, treasure, selection overlays) use `choose` with the option's `index`.
+- `confirm`/`cancel` resolve selection overlays; `skip` declines an optional \
+  reward; `proceed` advances a screen needing no decision; `advance_dialogue` \
+  steps through event text; `menu_select` picks a menu option string.
+
 Principles:
 - Win the run: survive, build a coherent deck, and beat each act's boss.
 - Think about the whole run, not just the current turn. Deck quality and HP \
   preservation usually matter more than greedy short-term value.
 - In combat: account for enemy intents, your block, energy, and incoming \
   damage. Don't take avoidable damage; set up for upcoming tougher fights.
-- Only choose from options the game is actually offering right now. The state \
-  lists what's currently legal — never invent an option that isn't there.
-- When a screen needs no real decision, use `proceed`. When an optional reward \
-  isn't worth it, use `skip`.
+- Only choose from options the game is actually offering right now (respect \
+  `can_play`, `can_skip`, `can_confirm`, available indices). Never invent one.
 
 Call exactly one tool per step. Keep reasoning focused and decisive."""
 
@@ -94,12 +104,20 @@ class SpireAgent:
             name, args = self._decide(state)
             self._log(f"[{step}] -> {name}({args})")
 
-            action = action_from_tool_call(name, args)
-            result = self.client.send_action(action)
+            try:
+                action = action_from_tool_call(name, args, state)
+            except IllegalActionError as e:
+                # Claude picked a tool that doesn't apply to this screen. Skip
+                # the POST and re-read; next step it sees the same state and can
+                # correct. (Rare; mostly a guardrail against model mistakes.)
+                self._log(f"    illegal action skipped: {e}")
+                state = self.client.get_state()
+                continue
 
-            # Some mod versions return the new state from the action POST; if not,
-            # re-read it. Either way we end the loop body holding fresh state.
-            state = result if _looks_like_state(result) else self.client.get_state()
+            self.client.send_action(action)
+            # POST may or may not echo state; always re-read so we hold the
+            # authoritative current state for the next decision.
+            state = self.client.get_state()
 
         self._log(f"Hit max_steps ({self.max_steps}); stopping.")
 
@@ -112,12 +130,8 @@ def _tools_with_cache() -> list[dict[str, Any]]:
     return tools
 
 
-def _looks_like_state(obj: Any) -> bool:
-    return isinstance(obj, dict) and len(obj) > 0 and "action" not in obj
-
-
 def _run_is_over(state: dict[str, Any]) -> bool:
-    """Heuristic end-of-run detection. ⚠️ Confirm the real field once the mod
-    is running — adjust the keys/values to match STS2MCP's state schema."""
-    screen = str(state.get("screen") or state.get("screen_type") or "").lower()
-    return screen in {"game_over", "victory", "death", "main_menu"}
+    """End-of-run detection against STS2MCP's schema: `game_over` is the
+    terminal run screen. We stop there rather than at `menu` so the agent can
+    still be pointed at the menu to start a run (see future menu-driving work)."""
+    return str(state.get("state_type", "")) == "game_over"

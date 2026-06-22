@@ -4,3 +4,7 @@ __pycache__/
 runs/
 .venv/
 venv/
+
+# Local-only: game-state captures and vendored mod docs (see STS2MCP repo)
+sample_state.json
+raw-full.md

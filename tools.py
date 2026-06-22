@@ -1,123 +1,198 @@
 """
-Tool definitions exposed to Claude.
+Tool definitions exposed to Claude, plus translation to STS2MCP action verbs.
 
-Design choice (from the plan): we don't let Claude emit free text actions.
-Instead it can only call these tools, and we validate the inputs against the
-*currently legal* options before forwarding to the mod. This keeps the agent
-from hallucinating illegal moves (playing a card it can't afford, choosing a
-reward index that doesn't exist, etc.).
+Confirmed against STS2MCP v0.4.0 (raw-full.md). The mod exposes ~25 specific
+action verbs, most of which are an index choice on a particular screen
+(claim_reward, choose_map_node, select_relic, ...). Rather than surface all 25
+as near-identical tools, we give Claude a small, legible tool set and dispatch
+the generic ones to the correct verb using the current `state_type`. The
+screen->verb mapping below is the one coupling point to the mod's action schema;
+it's kept as explicit tables so it's easy to audit against the docs.
 
-Each tool maps to a category of STS2MCP action. The exact action payload that
-gets POSTed to the mod is assembled in `action_from_tool_call` — that's the
-other place (besides sts2mcp_client.py) that's coupled to the mod's action
-schema, so it's kept small and explicit.
+Combat actions (play_card/use_potion/discard_potion/end_turn) stay explicit
+because they carry distinct parameters (a card index plus a string enemy
+`entity_id` target, or a potion `slot`).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+# Screen (state_type) -> the action verb a single "choose by index" maps to,
+# and the parameter name that verb expects for the index.
+CHOOSE_DISPATCH: dict[str, tuple[str, str]] = {
+    "rewards": ("claim_reward", "index"),
+    "card_reward": ("select_card_reward", "card_index"),
+    "event": ("choose_event_option", "index"),
+    "rest_site": ("choose_rest_option", "index"),
+    "shop": ("shop_purchase", "index"),
+    "fake_merchant": ("shop_purchase", "index"),
+    "map": ("choose_map_node", "index"),
+    "card_select": ("select_card", "index"),
+    "bundle_select": ("select_bundle", "index"),
+    "relic_select": ("select_relic", "index"),
+    "treasure": ("claim_treasure_relic", "index"),
+    "hand_select": ("combat_select_card", "card_index"),
+}
 
-# The tool schemas Claude sees. Keep descriptions tight and action-focused.
+# Screen -> verb for a "confirm" with no index (overlays / hand selection).
+CONFIRM_DISPATCH: dict[str, str] = {
+    "hand_select": "combat_confirm_selection",
+    "card_select": "confirm_selection",
+    "bundle_select": "confirm_bundle_selection",
+}
+
+# Screen -> verb for a "cancel".
+CANCEL_DISPATCH: dict[str, str] = {
+    "card_select": "cancel_selection",
+    "bundle_select": "cancel_bundle_selection",
+}
+
+# Screen -> verb for a "skip"/decline.
+SKIP_DISPATCH: dict[str, str] = {
+    "card_reward": "skip_card_reward",
+    "relic_select": "skip_relic_selection",
+}
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "play_card",
         "description": (
-            "Play a card from your hand during combat. Provide the card's hand "
-            "index and, if the card requires a target, the enemy's index."
+            "Play a card from your hand in combat. Use the card's `index`. If the "
+            "card's target_type names an enemy (AnyEnemy etc.), pass `target` as "
+            "that enemy's `entity_id` string (e.g. 'JAW_WORM_0') from battle.enemies."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "card_index": {
-                    "type": "integer",
-                    "description": "0-based index of the card in your hand.",
-                },
-                "target_index": {
-                    "type": "integer",
-                    "description": "0-based index of the target enemy. Omit for untargeted cards.",
-                },
+                "card_index": {"type": "integer", "description": "Card's `index` in your hand."},
+                "target": {"type": "string", "description": "Target enemy's `entity_id`. Omit for untargeted cards."},
             },
             "required": ["card_index"],
         },
     },
     {
-        "name": "end_turn",
-        "description": "End your turn in combat once you've played the cards you want.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
         "name": "use_potion",
-        "description": "Use a potion. Provide the potion slot index and a target if needed.",
+        "description": "Use a potion by its `slot`. Pass `target` (an enemy entity_id) if its target_type needs one.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "potion_index": {"type": "integer"},
-                "target_index": {"type": "integer"},
+                "slot": {"type": "integer"},
+                "target": {"type": "string"},
             },
-            "required": ["potion_index"],
+            "required": ["slot"],
         },
+    },
+    {
+        "name": "discard_potion",
+        "description": "Discard a potion you don't want, by its `slot`, to free a belt slot.",
+        "input_schema": {"type": "object", "properties": {"slot": {"type": "integer"}}, "required": ["slot"]},
+    },
+    {
+        "name": "end_turn",
+        "description": "End your combat turn once you've played what you want.",
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "choose",
         "description": (
-            "Make a non-combat choice: pick a card reward, relic, shop item, "
-            "event option, map node, or any menu choice the game is currently "
-            "presenting. Provide the 0-based index of the option you want."
+            "Pick an option by its `index` on whatever screen is active: a reward, "
+            "card reward, event option, rest option, shop item, map node, or a "
+            "selection overlay. Use the `index` shown next to the option in the state."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "option_index": {
-                    "type": "integer",
-                    "description": "0-based index into the list of currently available choices.",
-                },
-            },
-            "required": ["option_index"],
+            "properties": {"index": {"type": "integer", "description": "0-based `index` of the option to take."}},
+            "required": ["index"],
         },
     },
     {
+        "name": "confirm",
+        "description": "Confirm the current selection (in-combat card selection or a selection overlay).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel",
+        "description": "Cancel/back out of the current selection overlay.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "skip",
-        "description": (
-            "Skip / decline the current optional choice (e.g. skip a card reward, "
-            "leave a shop, proceed without resting). Use when no option is worth taking."
-        ),
+        "description": "Skip/decline the current optional choice (e.g. skip a card reward or relic choice) when nothing is worth taking.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "proceed",
-        "description": (
-            "Advance the game when no real decision is required — confirm a "
-            "result screen, continue past a transition, etc."
-        ),
+        "description": "Advance/confirm a screen that needs no real decision (leave a rewards screen, continue past a result).",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "advance_dialogue",
+        "description": "Advance event/story dialogue to the next line.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "menu_select",
+        "description": "On a menu screen, select an advertised `option` string (e.g. 'singleplayer', 'standard', 'main_menu', a character id).",
+        "input_schema": {"type": "object", "properties": {"option": {"type": "string"}}, "required": ["option"]},
     },
 ]
 
 
-def action_from_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Translate a Claude tool call into a mod action payload.
+class IllegalActionError(ValueError):
+    """The chosen tool doesn't apply to the current screen."""
 
-    ⚠️ VERSION-DEPENDENT shape: this assembles the dict POSTed to STS2MCP's
-    action endpoint. Adjust the field names here if your mod build expects a
-    different schema. Kept intentionally flat and explicit.
+
+def action_from_tool_call(name: str, args: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Translate a Claude tool call into a POST body for /api/v1/singleplayer.
+
+    `state` is the current game state; its `state_type` is used to dispatch the
+    generic choose/confirm/cancel/skip tools to the correct screen-specific verb.
     """
+    screen = str(state.get("state_type", ""))
+
     if name == "play_card":
-        action: dict[str, Any] = {"action": "play_card", "card_index": args["card_index"]}
-        if "target_index" in args and args["target_index"] is not None:
-            action["target_index"] = args["target_index"]
-        return action
+        body: dict[str, Any] = {"action": "play_card", "card_index": args["card_index"]}
+        if args.get("target"):
+            body["target"] = args["target"]
+        return body
+    if name == "use_potion":
+        body = {"action": "use_potion", "slot": args["slot"]}
+        if args.get("target"):
+            body["target"] = args["target"]
+        return body
+    if name == "discard_potion":
+        return {"action": "discard_potion", "slot": args["slot"]}
     if name == "end_turn":
         return {"action": "end_turn"}
-    if name == "use_potion":
-        action = {"action": "use_potion", "potion_index": args["potion_index"]}
-        if "target_index" in args and args["target_index"] is not None:
-            action["target_index"] = args["target_index"]
-        return action
-    if name == "choose":
-        return {"action": "choose", "option_index": args["option_index"]}
-    if name == "skip":
-        return {"action": "skip"}
+    if name == "advance_dialogue":
+        return {"action": "advance_dialogue"}
     if name == "proceed":
         return {"action": "proceed"}
+    if name == "menu_select":
+        return {"action": "menu_select", "option": args["option"]}
+
+    if name == "choose":
+        verb_param = CHOOSE_DISPATCH.get(screen)
+        if verb_param is None:
+            raise IllegalActionError(f"`choose` has no mapping on screen '{screen}'")
+        verb, param = verb_param
+        return {"action": verb, param: args["index"]}
+    if name == "confirm":
+        verb = CONFIRM_DISPATCH.get(screen)
+        if verb is None:
+            raise IllegalActionError(f"`confirm` has no mapping on screen '{screen}'")
+        return {"action": verb}
+    if name == "cancel":
+        verb = CANCEL_DISPATCH.get(screen)
+        if verb is None:
+            raise IllegalActionError(f"`cancel` has no mapping on screen '{screen}'")
+        return {"action": verb}
+    if name == "skip":
+        verb = SKIP_DISPATCH.get(screen)
+        if verb is None:
+            raise IllegalActionError(f"`skip` has no mapping on screen '{screen}'")
+        return {"action": verb}
+
     raise ValueError(f"Unknown tool: {name}")
