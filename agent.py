@@ -69,13 +69,14 @@ Call exactly one tool per step. Keep reasoning focused and decisive."""
 class SpireAgent:
     def __init__(self, client: STS2MCPClient, anthropic: Anthropic | None = None,
                  max_steps: int = 2000, verbose: bool = True, log_dir: str | None = "runs",
-                 show_thoughts: bool = True):
+                 show_thoughts: bool = True, action_delay: float = 0.4):
         self.client = client
         self.anthropic = anthropic or Anthropic()
         self.max_steps = max_steps
         self.verbose = verbose
         self.show_thoughts = show_thoughts
         self.log_dir = log_dir
+        self.action_delay = action_delay   # buffer for the mod to apply an action
         self._log_file = None              # opened lazily in run()
         self._last_nudge_sig: str | None = None  # end-turn nudge de-dupe
 
@@ -243,9 +244,11 @@ class SpireAgent:
 
             before = _signature(state)
             self.client.send_action(action)
-            # POST may or may not echo state; always re-read so we hold the
-            # authoritative current state for the next decision.
-            state = self.client.get_state()
+            # The mod applies actions on an async queue (animations, queued
+            # effects), so the state right after the POST can predate the card
+            # landing. Buffer, then read — polling until the state actually
+            # changes so we capture the post-action state, not a stale frame.
+            state = self._read_after_action(before)
 
             # No-progress guard: if the action left the state byte-for-byte
             # identical, it was a no-op (e.g. re-selecting an already-selected
@@ -260,6 +263,19 @@ class SpireAgent:
                 hint = None
 
         self._log(f"Hit max_steps ({self.max_steps}); stopping.")
+
+    def _read_after_action(self, before_sig: str) -> dict[str, Any]:
+        """Read state after an action, waiting for the mod to apply it. Sleeps a
+        buffer, then re-reads until the state changes from `before_sig` (up to a
+        few tries). A genuine no-op settles to the unchanged state after the
+        tries, which the no-progress guard then detects."""
+        state = self.client.get_state()
+        for _ in range(4):
+            time.sleep(self.action_delay)
+            state = self.client.get_state()
+            if _signature(state) != before_sig:
+                break
+        return state
 
     def _await_player_turn(self, state: dict[str, Any], max_polls: int = 90,
                            delay: float = 0.4) -> dict[str, Any]:
