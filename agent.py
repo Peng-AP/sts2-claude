@@ -20,7 +20,7 @@ from state_compaction import compact_state, estimate_tokens
 from sts2mcp_client import STS2MCPClient
 from tools import TOOLS, IllegalActionError, action_from_tool_call
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """\
 You are an expert Slay the Spire 2 player controlling a full run. You will be \
@@ -95,13 +95,32 @@ class SpireAgent:
         if not self.log_dir:
             return
         os.makedirs(self.log_dir, exist_ok=True)
-        path = os.path.join(self.log_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+        path = os.path.join(self.log_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}.log")
         self._log_file = open(path, "w", encoding="utf-8")
+        self._log_file.write(
+            f"Slay the Spire 2 — agent run {time.strftime('%Y-%m-%d %H:%M:%S')} ({MODEL})\n"
+            + "=" * 60 + "\n\n"
+        )
+        self._log_file.flush()
         self._log(f"Logging run to {path}")
 
-    def _record(self, entry: dict[str, Any]) -> None:
+    def _record_step(self, step: int, state_type: str, thinking: str,
+                     name: str, args: dict[str, Any]) -> None:
+        """Append a human-readable step to the run log."""
+        if not self._log_file:
+            return
+        self._log_file.write(f"[{step:>4}] {state_type}\n")
+        if thinking:
+            self._log_file.write("  thinking:\n")
+            for line in thinking.strip().splitlines():
+                self._log_file.write(f"    {line}\n" if line.strip() else "\n")
+        self._log_file.write(f"  action: {_format_action(name, args)}\n\n")
+        self._log_file.flush()
+
+    def _note(self, text: str) -> None:
+        """Append a one-line note (waits, nudges) to the run log."""
         if self._log_file:
-            self._log_file.write(json.dumps(entry, default=str) + "\n")
+            self._log_file.write(f"  ({text})\n\n")
             self._log_file.flush()
 
     def _decide(self, state: dict[str, Any], hint: str | None = None) -> tuple[str, dict[str, Any], str]:
@@ -186,6 +205,7 @@ class SpireAgent:
             # fight ends). Saves an API call on every enemy turn.
             if _is_enemy_turn(state):
                 self._log(f"[{step}] enemy turn — waiting for player control")
+                self._note("enemy turn — waited for player control")
                 state = self._await_player_turn(state)
                 hint = None
                 continue
@@ -193,11 +213,8 @@ class SpireAgent:
             name, args, thinking = self._decide(state, hint)
             if self.show_thoughts and thinking:
                 self._log("    [think] " + thinking.replace("\n", "\n    "))
-            self._log(f"[{step}] -> {name}({args})")
-            self._record({
-                "step": step, "state_type": state.get("state_type"),
-                "thinking": thinking, "tool": name, "args": args,
-            })
+            self._log(f"[{step}] -> {_format_action(name, args)}")
+            self._record_step(step, str(state.get("state_type")), thinking, name, args)
 
             # End-turn sanity nudge: if it tries to end the turn with energy and
             # playable cards still in hand, push back once (per state) so it
@@ -211,6 +228,7 @@ class SpireAgent:
                             "Block if any enemy intends to attack. Only end the turn if "
                             "you have a real reason to hold.")
                     self._log("    (end_turn with resources left — nudging to reconsider)")
+                    self._note("end_turn with resources left — nudged to reconsider")
                     continue
 
             try:
@@ -218,6 +236,7 @@ class SpireAgent:
             except IllegalActionError as e:
                 # Claude picked a tool that doesn't apply to this screen.
                 self._log(f"    illegal action skipped: {e}")
+                self._note(f"illegal action skipped: {e}")
                 hint = f"`{name}` is not valid on the '{state.get('state_type')}' screen. Choose a different action."
                 state = self.client.get_state()
                 continue
@@ -236,6 +255,7 @@ class SpireAgent:
                 hint = (f"Your previous action {name}({args}) did NOT change the game "
                         "state. It had no effect — choose a DIFFERENT option this time.")
                 self._log("    (no state change — nudging model)")
+                self._note("no state change — nudged model")
             else:
                 hint = None
 
@@ -261,6 +281,14 @@ def _is_enemy_turn(state: dict[str, Any]) -> bool:
     if battle.get("is_play_phase") is False:
         return True
     return str(battle.get("turn", "")).lower() == "enemy"
+
+
+def _format_action(name: str, args: dict[str, Any]) -> str:
+    """Render an action like play_card(card_index=0, target=JAW_WORM_0)."""
+    if not args:
+        return f"{name}()"
+    inner = ", ".join(f"{k}={v}" for k, v in args.items())
+    return f"{name}({inner})"
 
 
 def _signature(state: dict[str, Any]) -> str:

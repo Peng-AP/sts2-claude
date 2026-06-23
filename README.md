@@ -2,10 +2,10 @@
 
 A Python agent that plays **Slay the Spire 2** using the Claude API. It reads
 structured game state from the **STS2MCP** mod's localhost REST API, asks Claude
-(`claude-opus-4-8`, adaptive thinking) for the next move, and sends the action back.
+(`claude-sonnet-4-6`, adaptive thinking) for the next move, and sends the action back.
 
 ```
-StS2 + STS2MCP  <--HTTP :15526-->  Python agent loop  --Claude API-->  claude-opus-4-8
+StS2 + STS2MCP  <--HTTP :15526-->  Python agent loop  --Claude API-->  claude-sonnet-4-6
 ```
 
 ## Setup
