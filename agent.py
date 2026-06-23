@@ -12,7 +12,11 @@ import json
 import os
 import sys
 import time
+from collections import namedtuple
 from typing import Any
+
+# One model decision, plus the message blocks needed to extend turn history.
+Decision = namedtuple("Decision", "name args thinking tool_id assistant_content user_message")
 
 from anthropic import Anthropic
 
@@ -60,6 +64,10 @@ Combat strategy (this is where most runs are won or lost):
 
 General:
 - Win the run: survive, build a focused deck, beat each act's boss.
+- On non-combat screens a `your_deck` field (when present) lists your full
+  current deck as card-name -> count. Use it for deck-shaping decisions: pick
+  card rewards that fit a coherent plan, skip cards that dilute the deck, and
+  decide at rest sites whether to upgrade (smith) vs heal based on the deck.
 - Only choose from options actually offered right now (respect `can_play`, \
   `can_skip`, `can_confirm`, available indices). Never invent one.
 
@@ -77,6 +85,7 @@ class SpireAgent:
         self.show_thoughts = show_thoughts
         self.log_dir = log_dir
         self.action_delay = action_delay   # buffer for the mod to apply an action
+        self._deck_cards: list[str] = []   # latest known master deck (from combat)
         self._log_file = None              # opened lazily in run()
         self._last_nudge_sig: str | None = None  # end-turn nudge de-dupe
 
@@ -124,45 +133,96 @@ class SpireAgent:
             self._log_file.write(f"  ({text})\n\n")
             self._log_file.flush()
 
-    def _decide(self, state: dict[str, Any], hint: str | None = None) -> tuple[str, dict[str, Any], str]:
-        """Ask Claude for one action given the current state. `hint` carries a
-        note about the previous step (e.g. it had no effect) to break loops.
-        Returns (tool_name, args, thinking_text)."""
+    def _decide(self, state: dict[str, Any], hint: str | None = None,
+                history: list | None = None, pending_tool_id: str | None = None) -> Decision:
+        """Ask Claude for one action. `hint` carries a note about the previous
+        step (loop-breaking). `history` + `pending_tool_id` thread per-turn combat
+        context: history is the prior messages of the current turn, and when set,
+        pending_tool_id links this state to the previous action via a tool_result
+        so the model sees its own move sequence within the turn.
+
+        Returns a Decision(name, args, thinking, tool_id, assistant_content,
+        user_message) — the last two let the caller extend the turn history."""
         compact = compact_state(state)
+        deck = self._deck_for(state)
+        if deck is not None:
+            compact = {**compact, "your_deck": deck}
         if self.verbose:
             self._log(
                 f"    state tokens ~{estimate_tokens(state)} -> ~{estimate_tokens(compact)} "
-                "(compacted)"
+                "(compacted)" + ("" if not history else f", turn history {len(history)//2} step(s)")
             )
         nudge = f"\n\nNOTE: {hint}\n" if hint else ""
-        user_content = (
+        text = (
             "Current Slay the Spire 2 game state:\n\n"
             f"```json\n{json.dumps(compact, indent=2)}\n```\n"
             f"{nudge}\n"
             "Take the single best next action by calling one tool."
         )
-        messages = [{"role": "user", "content": user_content}]
+        # When continuing a combat turn, the new user message must open with a
+        # tool_result for the previous action's tool_use before the new state.
+        if pending_tool_id:
+            content: Any = [
+                {"type": "tool_result", "tool_use_id": pending_tool_id,
+                 "content": "Action applied. Updated state:"},
+                {"type": "text", "text": text},
+            ]
+        else:
+            content = text
+        user_message = {"role": "user", "content": content}
+        messages = (history or []) + [user_message]
 
-        # Primary call: extended thinking ON for strategic reasoning. The API
-        # forbids forcing tool use while thinking is enabled, so tool_choice is
-        # "auto" — with the system prompt's "call exactly one tool" instruction,
-        # Opus calls a tool essentially every time.
+        # Primary call: extended thinking ON. The API forbids forcing tool use
+        # while thinking is on, so tool_choice is "auto"; the system prompt's
+        # "call exactly one tool" makes the model call one essentially always.
         resp = self._create(messages, thinking=True, force_tool=False)
         thinking = _thinking_text(resp)
         tool = _first_tool_use(resp)
-        if tool is not None:
-            return tool[0], tool[1], thinking
+        if tool is None:
+            # Rare: replied without a tool. Force one (requires thinking OFF).
+            self._log("    no tool in thinking response; forcing a tool call")
+            resp = self._create(messages, thinking=False, force_tool=True)
+            tool = _first_tool_use(resp)
+        if tool is None:
+            raise RuntimeError("Claude returned no tool_use block")
+        name, args, tool_id = tool
+        return Decision(name, args, thinking, tool_id, list(resp.content), user_message)
 
-        # Fallback for the rare turn where it replied without a tool: force a
-        # tool call (which requires thinking OFF) so the loop never stalls.
-        self._log("    no tool in thinking response; forcing a tool call")
-        resp = self._create(messages, thinking=False, force_tool=True)
-        tool = _first_tool_use(resp)
-        if tool is not None:
-            return tool[0], tool[1], thinking
-        raise RuntimeError("Claude returned no tool_use block")
+    def _deck_for(self, state: dict[str, Any]) -> dict[str, int] | None:
+        """A compact name->count view of the known deck, for non-combat decision
+        screens (card reward, rest site, shop, …) where the deck isn't in state.
+        None during combat (the piles are already present) or before we've seen
+        any combat to snapshot from."""
+        if str(state.get("state_type", "")) in ("monster", "elite", "boss"):
+            return None
+        if not self._deck_cards:
+            return None
+        counts: dict[str, int] = {}
+        for name in self._deck_cards:
+            counts[name] = counts.get(name, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def _update_deck_snapshot(self, state: dict[str, Any]) -> None:
+        """Snapshot the master deck from a round-1 combat state: the union of all
+        four piles is the full deck, cleanest at the start of a fight."""
+        if str(state.get("state_type", "")) not in ("monster", "elite", "boss"):
+            return
+        battle = state.get("battle") or {}
+        if battle.get("round") != 1:
+            return
+        player = state.get("player") or {}
+        cards: list[str] = []
+        for c in player.get("hand") or []:
+            cards.append(str(c.get("name", "?")))
+        for pile in ("draw_pile", "discard_pile", "exhaust_pile"):
+            for c in player.get(pile) or []:
+                cards.append(str(c.get("name", "?")))
+        if cards:
+            self._deck_cards = cards
 
     def _create(self, messages: list[dict[str, Any]], *, thinking: bool, force_tool: bool):
+        if not thinking:
+            messages = _strip_thinking(messages)
         kwargs: dict[str, Any] = dict(
             model=MODEL,
             max_tokens=4096,
@@ -196,10 +256,19 @@ class SpireAgent:
 
     def _loop(self, state: dict[str, Any]) -> None:
         hint: str | None = None
+        # Per-turn combat history: messages accumulate within a player turn so
+        # the model sees its own card sequence, and reset at end_turn / when not
+        # in a combat player turn. Cross-turn history is intentionally dropped —
+        # it's expensive and low-value since each state is fully observable.
+        turn_history: list = []
+        pending_tool_id: str | None = None
+
         for step in range(self.max_steps):
             if _run_is_over(state):
                 self._log(f"Run ended after {step} steps.")
                 return
+
+            self._update_deck_snapshot(state)
 
             # Enemy turn: the player can't act, so don't spend a model call —
             # just poll until control returns (or the screen changes, e.g. the
@@ -209,18 +278,23 @@ class SpireAgent:
                 self._note("enemy turn — waited for player control")
                 state = self._await_player_turn(state)
                 hint = None
+                turn_history, pending_tool_id = [], None  # a new turn begins
                 continue
 
-            name, args, thinking = self._decide(state, hint)
-            if self.show_thoughts and thinking:
-                self._log("    [think] " + thinking.replace("\n", "\n    "))
-            self._log(f"[{step}] -> {_format_action(name, args)}")
-            self._record_step(step, str(state.get("state_type")), thinking, name, args)
+            in_combat = _is_player_combat(state)
+            if not in_combat:                       # stateless on non-combat screens
+                turn_history, pending_tool_id = [], None
+
+            d = self._decide(state, hint, turn_history, pending_tool_id)
+            if self.show_thoughts and d.thinking:
+                self._log("    [think] " + d.thinking.replace("\n", "\n    "))
+            self._log(f"[{step}] -> {_format_action(d.name, d.args)}")
+            self._record_step(step, str(state.get("state_type")), d.thinking, d.name, d.args)
 
             # End-turn sanity nudge: if it tries to end the turn with energy and
             # playable cards still in hand, push back once (per state) so it
             # doesn't waste energy / skip blocking. If it insists, let it.
-            if name == "end_turn" and _has_unspent_play(state):
+            if d.name == "end_turn" and _has_unspent_play(state):
                 sig = _signature(state)
                 if sig != self._last_nudge_sig:
                     self._last_nudge_sig = sig
@@ -230,17 +304,17 @@ class SpireAgent:
                             "you have a real reason to hold.")
                     self._log("    (end_turn with resources left — nudging to reconsider)")
                     self._note("end_turn with resources left — nudged to reconsider")
-                    continue
+                    continue  # don't commit; re-decide on the same state
 
             try:
-                action = action_from_tool_call(name, args, state)
+                action = action_from_tool_call(d.name, d.args, state)
             except IllegalActionError as e:
                 # Claude picked a tool that doesn't apply to this screen.
                 self._log(f"    illegal action skipped: {e}")
                 self._note(f"illegal action skipped: {e}")
-                hint = f"`{name}` is not valid on the '{state.get('state_type')}' screen. Choose a different action."
+                hint = f"`{d.name}` is not valid on the '{state.get('state_type')}' screen. Choose a different action."
                 state = self.client.get_state()
-                continue
+                continue  # don't commit; re-decide
 
             before = _signature(state)
             self.client.send_action(action)
@@ -250,12 +324,20 @@ class SpireAgent:
             # changes so we capture the post-action state, not a stale frame.
             state = self._read_after_action(before)
 
+            # Commit to the turn history (combat only) now that the action ran.
+            if in_combat:
+                turn_history.append(d.user_message)
+                turn_history.append({"role": "assistant", "content": d.assistant_content})
+                pending_tool_id = d.tool_id
+            if d.name == "end_turn":
+                turn_history, pending_tool_id = [], None  # turn over
+
             # No-progress guard: if the action left the state byte-for-byte
             # identical, it was a no-op (e.g. re-selecting an already-selected
             # menu item). Tell the model so it tries something else instead of
             # looping forever.
             if _signature(state) == before:
-                hint = (f"Your previous action {name}({args}) did NOT change the game "
+                hint = (f"Your previous action {d.name}({d.args}) did NOT change the game "
                         "state. It had no effect — choose a DIFFERENT option this time.")
                 self._log("    (no state change — nudging model)")
                 self._note("no state change — nudged model")
@@ -289,6 +371,12 @@ class SpireAgent:
         return state
 
 
+def _is_player_combat(state: dict[str, Any]) -> bool:
+    """True on a combat screen during the player's turn (where we accumulate
+    per-turn history). The enemy-turn case is handled before we ever decide."""
+    return str(state.get("state_type", "")) in ("monster", "elite", "boss")
+
+
 def _is_enemy_turn(state: dict[str, Any]) -> bool:
     """True when we're in combat but it's not the player's actionable window."""
     if str(state.get("state_type", "")) not in ("monster", "elite", "boss"):
@@ -297,6 +385,21 @@ def _is_enemy_turn(state: dict[str, Any]) -> bool:
     if battle.get("is_play_phase") is False:
         return True
     return str(battle.get("turn", "")).lower() == "enemy"
+
+
+def _strip_thinking(messages: list) -> list:
+    """Remove thinking blocks from assistant messages — needed when sending
+    history on a request that has thinking disabled (the forced-tool fallback)."""
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "assistant" and isinstance(content, list):
+            kept = [b for b in content
+                    if getattr(b, "type", None) not in ("thinking", "redacted_thinking")]
+            out.append({**m, "content": kept})
+        else:
+            out.append(m)
+    return out
 
 
 def _format_action(name: str, args: dict[str, Any]) -> str:
@@ -312,11 +415,11 @@ def _signature(state: dict[str, Any]) -> str:
     return json.dumps(state, sort_keys=True, default=str)
 
 
-def _first_tool_use(resp: Any) -> tuple[str, dict[str, Any]] | None:
-    """Return (tool_name, input) for the first tool_use block, or None."""
+def _first_tool_use(resp: Any) -> tuple[str, dict[str, Any], str] | None:
+    """Return (tool_name, input, tool_use_id) for the first tool_use block, or None."""
     for block in resp.content:
         if block.type == "tool_use":
-            return block.name, dict(block.input)
+            return block.name, dict(block.input), block.id
     return None
 
 
