@@ -9,6 +9,7 @@ through those tools.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from anthropic import Anthropic
@@ -127,6 +128,15 @@ class SpireAgent:
                 self._log(f"Run ended after {step} steps.")
                 return
 
+            # Enemy turn: the player can't act, so don't spend a model call —
+            # just poll until control returns (or the screen changes, e.g. the
+            # fight ends). Saves an API call on every enemy turn.
+            if _is_enemy_turn(state):
+                self._log(f"[{step}] enemy turn — waiting for player control")
+                state = self._await_player_turn(state)
+                hint = None
+                continue
+
             name, args = self._decide(state, hint)
             self._log(f"[{step}] -> {name}({args})")
 
@@ -157,6 +167,27 @@ class SpireAgent:
                 hint = None
 
         self._log(f"Hit max_steps ({self.max_steps}); stopping.")
+
+    def _await_player_turn(self, state: dict[str, Any], max_polls: int = 90,
+                           delay: float = 0.4) -> dict[str, Any]:
+        """Poll state (no model calls) until it's the player's turn again, the
+        combat ends, or we give up. Returns the latest state."""
+        for _ in range(max_polls):
+            if not _is_enemy_turn(state):
+                return state
+            time.sleep(delay)
+            state = self.client.get_state()
+        return state
+
+
+def _is_enemy_turn(state: dict[str, Any]) -> bool:
+    """True when we're in combat but it's not the player's actionable window."""
+    if str(state.get("state_type", "")) not in ("monster", "elite", "boss"):
+        return False
+    battle = state.get("battle") or {}
+    if battle.get("is_play_phase") is False:
+        return True
+    return str(battle.get("turn", "")).lower() == "enemy"
 
 
 def _signature(state: dict[str, Any]) -> str:
