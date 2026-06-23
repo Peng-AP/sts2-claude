@@ -9,6 +9,8 @@ through those tools.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from typing import Any
 
@@ -40,33 +42,72 @@ selection overlays, or menu). Act accordingly:
   character and choose `embark` to begin. Don't re-pick an option that's already
   selected — if a screen didn't change, the action had no effect.
 
-Principles:
-- Win the run: survive, build a coherent deck, and beat each act's boss.
-- Think about the whole run, not just the current turn. Deck quality and HP \
-  preservation usually matter more than greedy short-term value.
-- In combat: account for enemy intents, your block, energy, and incoming \
-  damage. Don't take avoidable damage; set up for upcoming tougher fights.
-- Only choose from options the game is actually offering right now (respect \
-  `can_play`, `can_skip`, `can_confirm`, available indices). Never invent one.
+Combat strategy (this is where most runs are won or lost):
+- SPEND YOUR ENERGY. Each turn, keep playing affordable cards (cost <= your \
+  current `energy`, `can_play` true) until you have no useful play left. Ending \
+  a turn with unspent energy and playable cards in hand is almost always a \
+  mistake — only do it if you are deliberately holding a card for next turn.
+- DEFEND, don't just attack. Read each enemy's `intents`: an Attack intent's \
+  `label` is the damage incoming this turn. Sum the incoming damage and compare \
+  it to your `block`. If enemies will hit you for meaningful damage, play your \
+  block/Defend skills (cards whose description says "Gain N Block") to absorb \
+  it. Trading a chunk of HP for a little extra damage is usually a bad trade — \
+  blunt big hits, especially from elites and bosses.
+- Sequence within a turn: apply debuffs (Weak/Vulnerable) before big attacks, \
+  focus one enemy down to reduce incoming damage, then block the rest.
+- Think about the whole run: HP and a coherent deck matter more than greedy \
+  short-term value. Skip cards that dilute your deck.
+
+General:
+- Win the run: survive, build a focused deck, beat each act's boss.
+- Only choose from options actually offered right now (respect `can_play`, \
+  `can_skip`, `can_confirm`, available indices). Never invent one.
 
 Call exactly one tool per step. Keep reasoning focused and decisive."""
 
 
 class SpireAgent:
     def __init__(self, client: STS2MCPClient, anthropic: Anthropic | None = None,
-                 max_steps: int = 2000, verbose: bool = True):
+                 max_steps: int = 2000, verbose: bool = True, log_dir: str | None = "runs",
+                 show_thoughts: bool = True):
         self.client = client
         self.anthropic = anthropic or Anthropic()
         self.max_steps = max_steps
         self.verbose = verbose
+        self.show_thoughts = show_thoughts
+        self.log_dir = log_dir
+        self._log_file = None              # opened lazily in run()
+        self._last_nudge_sig: str | None = None  # end-turn nudge de-dupe
 
     def _log(self, *a: Any) -> None:
-        if self.verbose:
-            print(*a, flush=True)
+        if not self.verbose:
+            return
+        msg = " ".join(str(x) for x in a)
+        # Windows consoles are often cp1252; thinking text/emoji can contain
+        # characters it can't encode. Degrade gracefully instead of crashing.
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "ascii"
+            print(msg.encode(enc, errors="replace").decode(enc), flush=True)
 
-    def _decide(self, state: dict[str, Any], hint: str | None = None) -> tuple[str, dict[str, Any]]:
+    def _open_log(self) -> None:
+        if not self.log_dir:
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+        self._log_file = open(path, "w", encoding="utf-8")
+        self._log(f"Logging run to {path}")
+
+    def _record(self, entry: dict[str, Any]) -> None:
+        if self._log_file:
+            self._log_file.write(json.dumps(entry, default=str) + "\n")
+            self._log_file.flush()
+
+    def _decide(self, state: dict[str, Any], hint: str | None = None) -> tuple[str, dict[str, Any], str]:
         """Ask Claude for one action given the current state. `hint` carries a
-        note about the previous step (e.g. it had no effect) to break loops."""
+        note about the previous step (e.g. it had no effect) to break loops.
+        Returns (tool_name, args, thinking_text)."""
         compact = compact_state(state)
         if self.verbose:
             self._log(
@@ -87,9 +128,10 @@ class SpireAgent:
         # "auto" — with the system prompt's "call exactly one tool" instruction,
         # Opus calls a tool essentially every time.
         resp = self._create(messages, thinking=True, force_tool=False)
+        thinking = _thinking_text(resp)
         tool = _first_tool_use(resp)
         if tool is not None:
-            return tool
+            return tool[0], tool[1], thinking
 
         # Fallback for the rare turn where it replied without a tool: force a
         # tool call (which requires thinking OFF) so the loop never stalls.
@@ -97,7 +139,7 @@ class SpireAgent:
         resp = self._create(messages, thinking=False, force_tool=True)
         tool = _first_tool_use(resp)
         if tool is not None:
-            return tool
+            return tool[0], tool[1], thinking
         raise RuntimeError("Claude returned no tool_use block")
 
     def _create(self, messages: list[dict[str, Any]], *, thinking: bool, force_tool: bool):
@@ -112,7 +154,10 @@ class SpireAgent:
             messages=messages,
         )
         if thinking:
-            kwargs["thinking"] = {"type": "adaptive"}
+            # display="summarized" opts into readable thinking text; on Opus 4.8
+            # the default is "omitted" (empty thinking blocks). The raw chain of
+            # thought is never returned — this is a summary of it.
+            kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
         if force_tool:
             kwargs["tool_choice"] = {"type": "any"}
         return self.anthropic.messages.create(**kwargs)
@@ -121,7 +166,15 @@ class SpireAgent:
         """Drive the run from current state until the game ends or we hit max_steps."""
         state = self.client.wait_until_ready()
         self._log("Mod connected. Starting run.")
+        self._open_log()
+        try:
+            self._loop(state)
+        finally:
+            if self._log_file:
+                self._log_file.close()
+                self._log_file = None
 
+    def _loop(self, state: dict[str, Any]) -> None:
         hint: str | None = None
         for step in range(self.max_steps):
             if _run_is_over(state):
@@ -137,8 +190,28 @@ class SpireAgent:
                 hint = None
                 continue
 
-            name, args = self._decide(state, hint)
+            name, args, thinking = self._decide(state, hint)
+            if self.show_thoughts and thinking:
+                self._log("    [think] " + thinking.replace("\n", "\n    "))
             self._log(f"[{step}] -> {name}({args})")
+            self._record({
+                "step": step, "state_type": state.get("state_type"),
+                "thinking": thinking, "tool": name, "args": args,
+            })
+
+            # End-turn sanity nudge: if it tries to end the turn with energy and
+            # playable cards still in hand, push back once (per state) so it
+            # doesn't waste energy / skip blocking. If it insists, let it.
+            if name == "end_turn" and _has_unspent_play(state):
+                sig = _signature(state)
+                if sig != self._last_nudge_sig:
+                    self._last_nudge_sig = sig
+                    hint = ("You're ending your turn with unspent energy and playable "
+                            "cards. Don't waste energy — play affordable cards, and add "
+                            "Block if any enemy intends to attack. Only end the turn if "
+                            "you have a real reason to hold.")
+                    self._log("    (end_turn with resources left — nudging to reconsider)")
+                    continue
 
             try:
                 action = action_from_tool_call(name, args, state)
@@ -201,6 +274,33 @@ def _first_tool_use(resp: Any) -> tuple[str, dict[str, Any]] | None:
         if block.type == "tool_use":
             return block.name, dict(block.input)
     return None
+
+
+def _thinking_text(resp: Any) -> str:
+    """Concatenate the model's visible thinking blocks (empty if none)."""
+    parts = []
+    for block in resp.content:
+        if block.type == "thinking":
+            parts.append(getattr(block, "thinking", "") or "")
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _has_unspent_play(state: dict[str, Any]) -> bool:
+    """True if it's combat, the player has energy, and at least one hand card is
+    playable and affordable — i.e. ending the turn now would waste energy."""
+    if str(state.get("state_type", "")) not in ("monster", "elite", "boss"):
+        return False
+    player = state.get("player") or {}
+    energy = player.get("energy") or 0
+    if energy <= 0:
+        return False
+    for card in player.get("hand") or []:
+        if not card.get("can_play", False):
+            continue
+        cost = str(card.get("cost", ""))
+        if cost == "X" or (cost.isdigit() and int(cost) <= energy):
+            return True
+    return False
 
 
 def _tools_with_cache() -> list[dict[str, Any]]:
