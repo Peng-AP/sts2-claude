@@ -137,6 +137,29 @@ TOOLS: list[dict[str, Any]] = [
         "description": "On a menu screen, select an advertised `option` string (e.g. 'singleplayer', 'standard', 'main_menu', a character id).",
         "input_schema": {"type": "object", "properties": {"option": {"type": "string"}}, "required": ["option"]},
     },
+    {
+        "name": "look_up",
+        "description": (
+            "Look up what a card or relic does — INCLUDING its upgraded version — "
+            "by name. Use it when you're unsure of an exact effect or want to "
+            "compare base vs upgraded before a card reward, a smith/upgrade, or a "
+            "shop buy. This is INFORMATION ONLY: it does NOT take a game turn, so "
+            "you can look up a couple of things and then make your real move. "
+            "`query` is fuzzy (e.g. 'perfected strike', 'ironclad block', 'silver "
+            "spoon'). Only items you've already discovered are searchable. For a "
+            "card that's currently enchanted/modified, trust its live `description` "
+            "in the state — the lookup shows the base/upgraded rules text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Card or relic name / fuzzy search text."},
+                "item_type": {"type": "string", "enum": ["card", "relic", "all"],
+                              "description": "Restrict the search. Default 'all'."},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 

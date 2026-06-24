@@ -25,6 +25,7 @@ import requests
 # (Multiplayer uses /api/v1/multiplayer; mixing the two returns HTTP 409.)
 STATE_PATH = "/api/v1/singleplayer"   # GET  -> current game state as JSON
 ACTION_PATH = "/api/v1/singleplayer"  # POST -> {"action": <verb>, ...params}
+WIKI_PATH = "/api/v1/wiki"            # GET  -> fuzzy card/relic lookup (read-only)
 HEALTH_PATH = "/"                     # GET  -> {"message": "...", "status": "ok"}
 # --------------------------------------------------------------------------
 
@@ -63,6 +64,21 @@ class STS2MCPClient:
             return resp.json() if resp.content else {}
         except requests.RequestException as e:
             raise STS2MCPError(f"Failed to send action to {ACTION_PATH}: {e}") from e
+
+    def wiki(self, query: str, item_type: str = "all", limit: int = 5) -> dict[str, Any]:
+        """Fuzzy-search the mod's card/relic wiki. Read-only — does NOT change
+        game state. For cards it returns both `base` and `upgraded` variants.
+        Scope is limited to items the active profile has discovered."""
+        try:
+            resp = self._session.get(
+                self._url(WIKI_PATH),
+                params={"query": query, "item_type": item_type, "limit": limit},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+        except requests.RequestException as e:
+            raise STS2MCPError(f"Wiki lookup failed for {query!r}: {e}") from e
 
     def wait_until_ready(self, attempts: int = 30, delay: float = 1.0) -> dict[str, Any]:
         """Poll get_state() until the mod server responds. Call this at startup

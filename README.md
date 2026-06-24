@@ -53,6 +53,20 @@ The code is written against the real STS2MCP API (see the mod's own
   game_over). `tools.py` maps the generic `choose`/`confirm`/`skip` tools to the
   correct screen-specific verb.
 - **Targeting** uses an enemy's `entity_id` string (e.g. `"JAW_WORM_0"`).
+- **Card/relic lookups**: `GET /api/v1/wiki?query=…&item_type=card|relic` fuzzy-
+  searches discovered items and returns each card's `base` *and* `upgraded`
+  variant. The agent's `look_up` tool uses this so the model can check a card's
+  exact effect (and what upgrading does) before card rewards, smith, or shop
+  buys. Lookups are information-only (no game turn) and capped per decision.
+
+## History scoping
+
+The agent threads message history only *within a decision episode* — a single
+combat player turn, or a contiguous stay on one non-combat screen (event, card
+reward, rest site, shop). Within an episode the model sees its own move sequence
+and any `look_up` results; the history resets when the episode changes (end of
+turn, enemy turn, or moving to a new screen). Cross-turn / cross-room context is
+intentionally dropped: state is fully observable, so it adds cost without value.
 
 Inspect live state anytime with the game running:
 
