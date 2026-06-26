@@ -57,6 +57,21 @@ Combat strategy (this is where most runs are won or lost):
   block/Defend skills (cards whose description says "Gain N Block") to absorb \
   it. Trading a chunk of HP for a little extra damage is usually a bad trade — \
   blunt big hits, especially from elites and bosses.
+- Reading the displayed numbers (important — the shown values are partially \
+  pre-computed, so don't double-count):
+  * Enemy attack intents: the intent `label` damage is already AFTER the \
+    enemy's own status (e.g. Weak on the enemy is baked in). Treat it as the \
+    real incoming damage and block against it directly.
+  * Your Block (on Defend-type cards): already AFTER your status (Frail is baked \
+    in; a 0 means it'd give no block) but BEFORE relic/power bonuses — so relics \
+    or powers that add block will give you MORE than the number shows.
+  * Your attack damage (on cards): already AFTER your own status (your Strength \
+    and any Weak on you are baked in) but BEFORE the enemy's status — so a \
+    Vulnerable enemy actually takes MORE than the listed number. EXCEPTION: in a \
+    single-enemy fight, or when every enemy is equally affected, the shown \
+    number already includes the enemy's status (Vulnerable etc.). So only expect \
+    extra damage beyond the label when targeting a debuffed enemy among several \
+    that are debuffed differently.
 - Sequence within a turn: apply debuffs (Weak/Vulnerable) before big attacks, \
   focus one enemy down to reduce incoming damage, then block the rest.
 - Think about the whole run: HP and a coherent deck matter more than greedy \
